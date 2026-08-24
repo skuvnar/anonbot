@@ -1,0 +1,28 @@
+# The settings below are what stop the container writing anything down.
+# `docker inspect anonbot` shows all of them if you want to check.
+services:
+  anonbot:
+    # Published by .github/workflows/build.yml on every push to main.
+    # To build it yourself instead:
+    #   docker build -t ghcr.io/skuvnar/anonbot:latest .
+    image: ghcr.io/skuvnar/anonbot:latest
+    container_name: anonbot
+    restart: unless-stopped
+    env_file: .env
+
+    # No volumes, no bind mounts, nowhere to write. Note the absence of a
+    # `volumes:` key - that absence is the audit.
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+
+    # Docker keeps no copy of stdout. Switch to json-file temporarily if you
+    # need to debug startup; emit() output contains no content or identifiers
+    # either way.
+    logging:
+      driver: none
+
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    pids_limit: 128
