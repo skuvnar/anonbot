@@ -29,10 +29,7 @@ from discord import app_commands
 # handler below stays short enough to read in one pass.
 # --------------------------------------------------------------------------
 
-TEXT_DELIVERED = (
-    "Posted anonymously. Nothing linking you to it exists on the server side.\n"
-    "This DM is the only record that you sent it - delete it if that matters to you."
-)
+TEXT_DELIVERED = "NF posting complete"
 TEXT_EMPTY = "Nothing to post - send some text."
 TEXT_NO_ATTACHMENTS = (
     "This bot relays text only. Images and files carry metadata that can identify "
@@ -44,9 +41,6 @@ TEXT_PAUSED = "The relay is paused by the moderators. Your message was not poste
 TEXT_NOT_MEMBER = "You are not currently in the server this bot posts to."
 TEXT_FAILED = "Discord rejected the post, so it did not go through. Try again."
 TEXT_UNAVAILABLE = "The relay channel is not reachable right now. Your message was not posted."
-
-RELAY_FOOTER = "anonymous"
-RELAY_COLOUR = 0x2B2D31
 
 
 # --------------------------------------------------------------------------
@@ -89,7 +83,10 @@ TOKEN = _require("DISCORD_TOKEN")
 GUILD_ID = _require_id("ANON_GUILD_ID")
 CHANNEL_ID = _require_id("ANON_CHANNEL_ID")
 
-MAX_MESSAGE_CHARS = _optional_int("MAX_MESSAGE_CHARS", 4000)
+# Discord caps a bot's message content at 2000 characters. Accepting more than
+# that would mean taking a submission we then cannot post, so the ceiling is
+# enforced here rather than discovered at send time.
+MAX_MESSAGE_CHARS = min(_optional_int("MAX_MESSAGE_CHARS", 2000), 2000)
 RATE_LIMIT_BURST = _optional_int("RATE_LIMIT_BURST", 5)
 RATE_LIMIT_PER_MINUTE = _optional_int("RATE_LIMIT_PER_MINUTE", 12)
 REQUIRE_MEMBERSHIP = _optional_flag("REQUIRE_GUILD_MEMBERSHIP", True)
@@ -194,20 +191,6 @@ _commands_synced = False
 _paused = False
 
 
-def _build_relay(content: str) -> discord.Embed:
-    """Wrap the message for posting.
-
-    An embed is used rather than plain text for one specific reason: mentions
-    inside an embed description are never resolved into pings, so an
-    @everyone in a submission cannot notify the server even if the
-    allowed_mentions guard on send() were ever removed. Markdown still renders
-    exactly as the sender typed it.
-    """
-    embed = discord.Embed(description=content, colour=RELAY_COLOUR)
-    embed.set_footer(text=RELAY_FOOTER)
-    return embed
-
-
 async def _receipt(message: discord.Message, text: str) -> None:
     """Acknowledge a submission in the sender's own DM channel.
 
@@ -287,10 +270,20 @@ async def on_message(message: discord.Message) -> None:
 
     # From here on, only `content` is in play. Nothing downstream of this
     # point has access to the sender.
+    # Posted as plain text. Every message in the relay channel is anonymous by
+    # definition, so there is nothing to mark or attribute. suppress_embeds
+    # stops links unfurling into preview cards, so a post appears exactly as
+    # it was typed and nothing else.
+    #
+    # allowed_mentions is the ONLY thing stopping a submission containing
+    # @everyone from notifying the whole server. Discord enforces it server
+    # side, so it holds regardless of what the text says - but remove it and
+    # the relay becomes a mass-ping button for anyone who wants one.
     try:
         await _relay_channel.send(
-            embed=_build_relay(content),
+            content,
             allowed_mentions=discord.AllowedMentions.none(),
+            suppress_embeds=True,
         )
     except discord.HTTPException:
         _count("relay_failed")

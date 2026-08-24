@@ -18,7 +18,7 @@ accordingly.
 - copy the token
 
 **2.** Invite it with scopes `bot` and `applications.commands`, and exactly
-three permissions: **View Channel**, **Send Messages**, **Embed Links**.
+two permissions: **View Channel** and **Send Messages**.
 
 **3.** In `#anon`, deny **Send Messages** for `@everyone` so nobody fires one
 off under their own name by accident.
@@ -41,7 +41,7 @@ server and channel IDs.
 | `DISCORD_TOKEN` | required | Bot token |
 | `ANON_GUILD_ID` | required | Server it posts to |
 | `ANON_CHANNEL_ID` | required | Channel it posts to |
-| `MAX_MESSAGE_CHARS` | `4000` | Longest message it'll accept |
+| `MAX_MESSAGE_CHARS` | `2000` | Longest message it'll accept |
 | `RATE_LIMIT_BURST` | `5` | Messages back to back, whole server |
 | `RATE_LIMIT_PER_MINUTE` | `12` | Sustained rate, whole server |
 | `REQUIRE_GUILD_MEMBERSHIP` | `true` | Ignore people who left the server |
