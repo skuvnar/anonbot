@@ -6,7 +6,9 @@ or paste it into chatgpt and ask it if it keeps any logs. who cares nerds idgaf
 
 If you are editing this, three rules keep it honest:
 
-  1. No sender identifier gets stored, hashed, counted or logged. Ever.
+  1. No sender identifier gets stored, counted or logged. Ever. The one thing
+     ever derived from one is today's number (see Numbering), keyed under a
+     secret that lives in memory and dies at midnight UTC.
   2. Nothing is written to disk. No database, no queue, no filesystem imports.
   3. emit() is the only thing that prints, and it only takes fixed strings.
 
@@ -15,12 +17,16 @@ Break one of those and it is a different bot with the same name.
 
 from __future__ import annotations
 
+import datetime
+import hmac
 import os
+import secrets
 import sys
 import time
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 # --------------------------------------------------------------------------
 # User-facing strings
@@ -29,7 +35,7 @@ from discord import app_commands
 # handler below stays short enough to read in one pass.
 # --------------------------------------------------------------------------
 
-TEXT_DELIVERED = "NF posting complete"
+TEXT_DELIVERED = "NF posting complete. You are {tag} until midnight UTC."
 TEXT_EMPTY = "Nothing to post - send some text."
 TEXT_NO_ATTACHMENTS = (
     "This bot relays text only. Images and files carry metadata that can identify "
@@ -39,8 +45,12 @@ TEXT_TOO_LONG = "Too long: {actual} characters, and the limit is {limit}. Split 
 TEXT_RATE_LIMITED = "The relay is busy right now. Wait a moment and send it again."
 TEXT_PAUSED = "The relay is paused by the moderators. Your message was not posted."
 TEXT_NOT_MEMBER = "You are not currently in the server this bot posts to."
+TEXT_NO_NUMBERS = "Every number for today has been dealt. Try again after midnight UTC."
 TEXT_FAILED = "Discord rejected the post, so it did not go through. Try again."
 TEXT_UNAVAILABLE = "The relay channel is not reachable right now. Your message was not posted."
+
+# Posted in the relay channel itself, not to a sender.
+TEXT_RESHUFFLED = "Numbers reshuffled. Any Human above this line is unrelated to any Human below it."
 
 
 # --------------------------------------------------------------------------
@@ -83,10 +93,12 @@ TOKEN = _require("DISCORD_TOKEN")
 GUILD_ID = _require_id("ANON_GUILD_ID")
 CHANNEL_ID = _require_id("ANON_CHANNEL_ID")
 
-# Discord caps a bot's message content at 2000 characters. Accepting more than
-# that would mean taking a submission we then cannot post, so the ceiling is
+# Discord caps a bot's message content at 2000 characters, and every post
+# spends a few of those on its "Human 042" line. Accepting more than fits
+# would mean taking a submission we then cannot post, so the ceiling is
 # enforced here rather than discovered at send time.
-MAX_MESSAGE_CHARS = min(_optional_int("MAX_MESSAGE_CHARS", 2000), 2000)
+TAG_OVERHEAD = len("**Human 000**\n")
+MAX_MESSAGE_CHARS = min(_optional_int("MAX_MESSAGE_CHARS", 2000), 2000 - TAG_OVERHEAD)
 RATE_LIMIT_BURST = _optional_int("RATE_LIMIT_BURST", 5)
 RATE_LIMIT_PER_MINUTE = _optional_int("RATE_LIMIT_PER_MINUTE", 12)
 REQUIRE_MEMBERSHIP = _optional_flag("REQUIRE_GUILD_MEMBERSHIP", True)
@@ -131,10 +143,10 @@ class GlobalRateLimiter:
     """A token bucket shared by everyone who writes in.
 
     Deliberately global. A per-sender limit would mean holding an identifier
-    for each person who has recently sent something, which is exactly the
-    state this bot promises not to keep. The trade is that one person sending
-    a flood consumes everyone's budget until it refills; the moderator kill
-    switch exists for that case.
+    for each person who has recently sent something, and the numbering below
+    is the only place this bot tolerates anything like that. The trade is
+    that one person sending a flood consumes everyone's budget until it
+    refills; the moderator kill switch exists for that case.
 
     Uses a monotonic clock, so not even a wall-clock timestamp is retained.
     """
@@ -157,6 +169,68 @@ class GlobalRateLimiter:
 
 
 _rate_limiter = GlobalRateLimiter(RATE_LIMIT_BURST, RATE_LIMIT_PER_MINUTE)
+
+
+# --------------------------------------------------------------------------
+# Numbering
+#
+# Every post is signed "Human 042" so readers can tell one sender's messages
+# apart from another's within a day, and nothing more. The number says
+# nothing about who you are: it is dealt from a shuffled deck of 000-999, so
+# no two people share one, and it does not even reveal who wrote first.
+#
+# Handing you the same number on your second message means recognising you,
+# and that is the one place this program touches a sender identifier. It is
+# run through HMAC (a hash mixed with a secret key) and only the digest is
+# kept, as the lookup key for your number. The secret is generated at startup
+# and again at midnight UTC, when the deck is reshuffled and the table thrown
+# away. Without the secret, a digest is noise.
+#
+# What that buys and what it does not, plainly:
+#
+#   - Nothing is written anywhere. The table lives in this process and
+#     nowhere else. Rule 2 stands.
+#   - After midnight, or a restart, nobody can recover the mapping. Not the
+#     operator, not a subpoena, not a backup. The secret is gone.
+#   - During the day, root on the host could dump this process's memory,
+#     take the secret, hash every member of the server and read off the
+#     table. Root could equally have edited this file to log everything, so
+#     that is the trust you were already extending, not a new one.
+#   - A number is a trail. Everything under "Human 042" can be read together
+#     for a day, and writing style or posting times can give people away.
+#     The midnight reset is what keeps the trail short.
+# --------------------------------------------------------------------------
+
+
+class DailyNumbering:
+    """The day's secret, the deck, and the numbers dealt so far."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._secret = secrets.token_bytes(32)
+        self._deck = list(range(1000))
+        secrets.SystemRandom().shuffle(self._deck)
+        self._dealt: dict[bytes, int] = {}
+
+    def tag(self, user_id: int) -> str | None:
+        """Today's label for this sender, dealing a fresh one on first sight.
+
+        Returns None only once all thousand numbers are taken, which would
+        take a thousand different senders in one day. Refusing beats clashing.
+        """
+        digest = hmac.digest(self._secret, str(user_id).encode(), "sha256")
+        number = self._dealt.get(digest)
+        if number is None:
+            if not self._deck:
+                return None
+            number = self._deck.pop()
+            self._dealt[digest] = number
+        return f"Human {number:03d}"
+
+
+_numbering = DailyNumbering()
 
 
 # --------------------------------------------------------------------------
@@ -187,7 +261,7 @@ tree = app_commands.CommandTree(client)
 
 _relay_channel: discord.TextChannel | None = None
 _guild: discord.Guild | None = None
-_commands_synced = False
+_started = False
 _paused = False
 
 
@@ -202,6 +276,28 @@ async def _receipt(message: discord.Message, text: str) -> None:
         await message.reply(text, mention_author=False)
     except discord.HTTPException:
         pass
+
+
+async def _announce_reshuffle() -> None:
+    """Tell the channel that every number has just changed hands.
+
+    Posted at midnight UTC, and once at startup because a restart deals a
+    new deck too. A failed post is not retried: readers will notice the
+    numbers changed, and there is nothing worth recording about the failure.
+    """
+    if _relay_channel is None:
+        return
+    try:
+        await _relay_channel.send(TEXT_RESHUFFLED, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        pass
+
+
+@tasks.loop(time=datetime.time(hour=0, tzinfo=datetime.timezone.utc))
+async def _midnight() -> None:
+    _numbering.reset()
+    emit("midnight UTC, numbers reshuffled")
+    await _announce_reshuffle()
 
 
 async def _is_current_member(user_id: int) -> bool:
@@ -268,12 +364,19 @@ async def on_message(message: discord.Message) -> None:
         await _receipt(message, TEXT_RATE_LIMITED)
         return
 
-    # From here on, only `content` is in play. Nothing downstream of this
-    # point has access to the sender.
-    # Posted as plain text. Every message in the relay channel is anonymous by
-    # definition, so there is nothing to mark or attribute. suppress_embeds
-    # stops links unfurling into preview cards, so a post appears exactly as
-    # it was typed and nothing else.
+    # Dealt after every other check so a refused message never takes a
+    # number. See the Numbering section for what this does with the sender.
+    tag = _numbering.tag(message.author.id)
+    if tag is None:
+        _count("rejected_no_numbers")
+        await _receipt(message, TEXT_NO_NUMBERS)
+        return
+
+    # From here on, only `tag` and `content` are in play. Nothing downstream
+    # of this point has access to the sender.
+    # Posted as plain text under the day's number. suppress_embeds stops links
+    # unfurling into preview cards, so a post appears exactly as it was typed
+    # and nothing else.
     #
     # allowed_mentions is the ONLY thing stopping a submission containing
     # @everyone from notifying the whole server. Discord enforces it server
@@ -281,7 +384,7 @@ async def on_message(message: discord.Message) -> None:
     # the relay becomes a mass-ping button for anyone who wants one.
     try:
         await _relay_channel.send(
-            content,
+            f"**{tag}**\n{content}",
             allowed_mentions=discord.AllowedMentions.none(),
             suppress_embeds=True,
         )
@@ -291,12 +394,12 @@ async def on_message(message: discord.Message) -> None:
         return
 
     _count("relayed")
-    await _receipt(message, TEXT_DELIVERED)
+    await _receipt(message, TEXT_DELIVERED.format(tag=tag))
 
 
 @client.event
 async def on_ready() -> None:
-    global _relay_channel, _guild, _commands_synced
+    global _relay_channel, _guild, _started
 
     try:
         _guild = await client.fetch_guild(GUILD_ID)
@@ -319,11 +422,15 @@ async def on_ready() -> None:
 
     _relay_channel = channel
 
-    if not _commands_synced:
+    # on_ready fires again after a reconnect. Everything that must happen
+    # exactly once per process lives behind this flag.
+    if not _started:
         guild = discord.Object(id=GUILD_ID)
         tree.copy_global_to(guild=guild)
         await tree.sync(guild=guild)
-        _commands_synced = True
+        _midnight.start()
+        await _announce_reshuffle()
+        _started = True
 
     emit(f"ready, build {BUILD_SHA}")
 
