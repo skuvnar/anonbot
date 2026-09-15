@@ -18,6 +18,7 @@ Break one of those and it is a different bot with the same name.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import hmac
 import os
@@ -277,6 +278,7 @@ tree = app_commands.CommandTree(client)
 _relay_channel: discord.TextChannel | None = None
 _webhook: discord.Webhook | None = None
 _button_id: int | None = None
+_button_lock = asyncio.Lock()
 _started = False
 _paused = False
 
@@ -329,17 +331,20 @@ async def _place_button() -> None:
     global _button_id
     if _relay_channel is None:
         return
-    if _button_id is not None:
+    # Two posts landing in the same instant would otherwise both delete the
+    # same old button and both post a new one, leaving one orphaned forever.
+    async with _button_lock:
+        if _button_id is not None:
+            try:
+                await _relay_channel.get_partial_message(_button_id).delete()
+            except discord.HTTPException:
+                pass
         try:
-            await _relay_channel.get_partial_message(_button_id).delete()
+            posted = await _relay_channel.send(view=AnonButton())
+            _button_id = posted.id
         except discord.HTTPException:
-            pass
-    try:
-        posted = await _relay_channel.send(view=AnonButton())
-        _button_id = posted.id
-    except discord.HTTPException:
-        _button_id = None
-        emit("could not post the button - does the bot have Send Messages in the relay channel?")
+            _button_id = None
+            emit("could not post the button - does the bot have Send Messages in the relay channel?")
 
 
 @tasks.loop(time=datetime.time(hour=0, tzinfo=datetime.timezone.utc))
@@ -427,6 +432,10 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
         # links unfurling into preview cards, so a post appears exactly as it
         # was typed and nothing else.
         #
+        # Waiting for confirmation makes Discord say the post exists before the
+        # button is moved below it. Without it the request is merely accepted,
+        # and the button can land first.
+        #
         # allowed_mentions is the ONLY thing stopping a submission containing
         # @everyone from notifying the whole server. Discord enforces it server
         # side, so it holds regardless of what the text says - but remove it
@@ -438,6 +447,7 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
                 avatar_url=f"{AVATAR_BASE}/{quote(avatar)}" if AVATAR_BASE else discord.utils.MISSING,
                 allowed_mentions=discord.AllowedMentions.none(),
                 suppress_embeds=True,
+                wait=True,
             )
         except discord.HTTPException:
             _count("relay_failed")
