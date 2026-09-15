@@ -31,20 +31,19 @@ from discord.ext import tasks
 # --------------------------------------------------------------------------
 # User-facing strings
 #
-# Every string a sender can ever see is collected here so that the message
+# Every string a sender can ever see is collected here so that the form
 # handler below stays short enough to read in one pass.
 # --------------------------------------------------------------------------
 
-TEXT_DELIVERED = "NF posting complete. You are {tag} until midnight UTC."
-TEXT_EMPTY = "Nothing to post - send some text."
-TEXT_NO_ATTACHMENTS = (
-    "This bot relays text only. Images and files carry metadata that can identify "
-    "you, so they are refused rather than forwarded."
-)
-TEXT_TOO_LONG = "Too long: {actual} characters, and the limit is {limit}. Split it up and send again."
+TEXT_BUTTON_PROMPT = "The channel is read-only. Use the button."
+TEXT_BUTTON_LABEL = "Post anonymously"
+TEXT_FORM_TITLE = "Post anonymously"
+TEXT_FORM_LABEL = "Your message"
+
+TEXT_EMPTY = "Nothing to post - the message was blank."
 TEXT_RATE_LIMITED = "The relay is busy right now. Wait a moment and send it again."
 TEXT_PAUSED = "The relay is paused by the moderators. Your message was not posted."
-TEXT_NOT_MEMBER = "You are not currently in the server this bot posts to."
+TEXT_WRONG_SERVER = "This only works in the server it posts to."
 TEXT_NO_NUMBERS = "Every number for today has been dealt. Try again after midnight UTC."
 TEXT_FAILED = "Discord rejected the post, so it did not go through. Try again."
 TEXT_UNAVAILABLE = "The relay channel is not reachable right now. Your message was not posted."
@@ -82,32 +81,21 @@ def _optional_int(name: str, default: int) -> int:
         sys.exit(f"[anonbot] {name} must be an integer")
 
 
-def _optional_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
-
-
 TOKEN = _require("DISCORD_TOKEN")
 GUILD_ID = _require_id("ANON_GUILD_ID")
 CHANNEL_ID = _require_id("ANON_CHANNEL_ID")
 
 # Discord caps a bot's message content at 2000 characters, and every post
-# spends a few of those on its "Human 042" line. Accepting more than fits
-# would mean taking a submission we then cannot post, so the ceiling is
-# enforced here rather than discovered at send time.
+# spends a few of those on its "Human 042" line. The form below refuses to
+# submit anything longer than fits, so the limit is enforced by Discord's own
+# client before the text ever reaches this program.
 TAG_OVERHEAD = len("**Human 000**\n")
 MAX_MESSAGE_CHARS = min(_optional_int("MAX_MESSAGE_CHARS", 2000), 2000 - TAG_OVERHEAD)
 RATE_LIMIT_BURST = _optional_int("RATE_LIMIT_BURST", 5)
 RATE_LIMIT_PER_MINUTE = _optional_int("RATE_LIMIT_PER_MINUTE", 12)
-REQUIRE_MEMBERSHIP = _optional_flag("REQUIRE_GUILD_MEMBERSHIP", True)
 
-# Injected at build time so the running container can name the source it was
-# built from. Meaningless on its own - see the verification section of the
-# README for what makes it worth anything.
+# Injected at build time, so the startup line can say which commit is running.
 BUILD_SHA = os.environ.get("GIT_SHA", "unknown")
-BUILD_SOURCE = os.environ.get("SOURCE_URL", "unknown")
 
 
 # --------------------------------------------------------------------------
@@ -240,40 +228,47 @@ _numbering = DailyNumbering()
 # to receive. What is requested here, and what is not, is the load-bearing
 # privacy claim of the whole project:
 #
-#   guilds       - channel topology, so the relay channel can be resolved.
-#                  Grants no access to messages or to member lists.
-#   dm_messages  - the DMs people send to this bot. Not a privileged intent.
+#   guilds - channel topology, so the relay channel can be resolved. Grants
+#            no access to messages or to member lists.
 #
-#   message_content is NOT requested, and must stay switched off in the
-#   Discord developer portal. It is the only mechanism by which a bot can read
-#   messages in server channels. Without it, this bot cannot read anything
-#   anyone says in the server - not by policy, by API. Discord supplies
-#   message content for DMs sent to an app regardless of this intent, which is
-#   why the relay still works.
+# That is the whole list. No message intent of any kind is requested, so
+# Discord never sends this bot a message from anyone, anywhere - not from a
+# server channel, not from a DM. The only thing a person can hand it is the
+# form behind the button, and the only thing in that form is the text box.
+#
+# message_content must stay switched off in the developer portal. It is not
+# needed, and it is the only mechanism by which a bot can read what people
+# say in server channels.
 # --------------------------------------------------------------------------
 
 intents = discord.Intents.none()
 intents.guilds = True
-intents.dm_messages = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 _relay_channel: discord.TextChannel | None = None
-_guild: discord.Guild | None = None
+_button_id: int | None = None
 _started = False
 _paused = False
 
 
-async def _receipt(message: discord.Message, text: str) -> None:
-    """Acknowledge a submission in the sender's own DM channel.
+async def _whisper(interaction: discord.Interaction, text: str) -> None:
+    """Reply to the person who submitted the form, and to nobody else.
 
-    Failures are swallowed. Some privacy settings block the bot from replying,
-    and a sender whose message was relayed but whose receipt bounced is not a
-    condition worth recording anywhere.
+    Every reply in this file goes through here so that the ephemeral flag is
+    set in exactly one place. It is load-bearing. Discord records whoever
+    triggered an interaction on any public reply to it and the client shows
+    that name, which would put the sender above their own anonymous post.
+    Do not add a second way of replying.
+
+    Once an interaction has been acknowledged (the form does this first, see
+    on_submit) a reply has to go out as a follow-up instead. Both paths are
+    private; a failed reply is not worth recording.
     """
+    send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
     try:
-        await message.reply(text, mention_author=False)
+        await send(text, ephemeral=True)
     except discord.HTTPException:
         pass
 
@@ -293,119 +288,158 @@ async def _announce_reshuffle() -> None:
         pass
 
 
+async def _place_button() -> None:
+    """Keep the button as the last thing in the channel.
+
+    The channel is read-only for everyone but the bot, so there is no text
+    box; the button stands where one would be. It is re-posted after every
+    relay and every reshuffle notice so it never scrolls out of reach. Only
+    the bot's own previous button is deleted, which needs no permission
+    beyond posting. After a restart the previous one is unknown and stays
+    where it is: it still works, and a moderator can delete it.
+    """
+    global _button_id
+    if _relay_channel is None:
+        return
+    if _button_id is not None:
+        try:
+            await _relay_channel.get_partial_message(_button_id).delete()
+        except discord.HTTPException:
+            pass
+    try:
+        posted = await _relay_channel.send(TEXT_BUTTON_PROMPT, view=AnonButton())
+        _button_id = posted.id
+    except discord.HTTPException:
+        _button_id = None
+        emit("could not post the button - does the bot have Send Messages in the relay channel?")
+
+
 @tasks.loop(time=datetime.time(hour=0, tzinfo=datetime.timezone.utc))
 async def _midnight() -> None:
     _numbering.reset()
     emit("midnight UTC, numbers reshuffled")
     await _announce_reshuffle()
+    await _place_button()
 
 
-async def _is_current_member(user_id: int) -> bool:
-    """Confirm the sender is still in the server.
+class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
+    """The popup behind the button. One text box, nothing else.
 
-    The identifier is handed straight to the Discord API and is not retained
-    past this call. Without the check, anyone who has ever opened a DM with
-    the bot could keep posting after leaving or being banned.
-
-    Fails open on transient API errors: an outage at Discord should not
-    silently swallow submissions from legitimate members.
+    A popup rather than a slash command, because Discord will not let a
+    slash command run in a channel where you cannot send messages, and a
+    read-only channel is the point: nothing to type into means no posting
+    under your own name by accident, and no "someone is typing" the moment
+    before an anonymous post appears. A button works in a read-only channel.
     """
-    if _guild is None:
-        return False
-    try:
-        await _guild.fetch_member(user_id)
-    except discord.NotFound:
-        return False
-    except discord.HTTPException:
-        return True
-    return True
+
+    field = discord.ui.Label(
+        text=TEXT_FORM_LABEL,
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            max_length=MAX_MESSAGE_CHARS,
+            required=True,
+        ),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Discord insists on some answer within three seconds of a form being
+        # submitted. This one closes the popup and shows the sender nothing.
+        # A successful post is its own receipt - it appears in the channel
+        # with the number on it - whereas a private "you are Human 042" would
+        # sit in the sender's view captioned with their own name, one
+        # screenshot away from undoing the whole point. Only refusals get a
+        # note, via _whisper.
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            return
+
+        if _relay_channel is None:
+            await _whisper(interaction, TEXT_UNAVAILABLE)
+            return
+
+        # The button only exists in the one channel, so this cannot normally
+        # be reached from anywhere else. Checked anyway, because the guarantee
+        # should not rest on where a message happens to sit.
+        if interaction.guild_id != GUILD_ID:
+            _count("rejected_wrong_server")
+            await _whisper(interaction, TEXT_WRONG_SERVER)
+            return
+
+        if _paused:
+            _count("rejected_paused")
+            await _whisper(interaction, TEXT_PAUSED)
+            return
+
+        content = self.field.component.value.strip()
+        if not content:
+            _count("rejected_empty")
+            await _whisper(interaction, TEXT_EMPTY)
+            return
+
+        if not _rate_limiter.take():
+            _count("rejected_rate_limited")
+            await _whisper(interaction, TEXT_RATE_LIMITED)
+            return
+
+        # Dealt after every other check so a refused message never takes a
+        # number. See the Numbering section for what this does with the sender.
+        tag = _numbering.tag(interaction.user.id)
+        if tag is None:
+            _count("rejected_no_numbers")
+            await _whisper(interaction, TEXT_NO_NUMBERS)
+            return
+
+        # From here on, only `tag` and `content` are in play. Nothing
+        # downstream of this point has access to the sender.
+        # Posted as an ordinary bot message, not as a reply to the interaction,
+        # which is what keeps the sender's name off it. suppress_embeds stops
+        # links unfurling into preview cards, so a post appears exactly as it
+        # was typed and nothing else.
+        #
+        # allowed_mentions is the ONLY thing stopping a submission containing
+        # @everyone from notifying the whole server. Discord enforces it server
+        # side, so it holds regardless of what the text says - but remove it
+        # and the relay becomes a mass-ping button for anyone who wants one.
+        try:
+            await _relay_channel.send(
+                f"**{tag}**\n{content}",
+                allowed_mentions=discord.AllowedMentions.none(),
+                suppress_embeds=True,
+            )
+        except discord.HTTPException:
+            _count("relay_failed")
+            await _whisper(interaction, TEXT_FAILED)
+            return
+
+        _count("relayed")
+        await _place_button()
 
 
-@client.event
-async def on_message(message: discord.Message) -> None:
-    # Guild messages cannot be read without the message content intent, which
-    # this bot does not request. Checking anyway means the guarantee does not
-    # rest on the portal toggle alone.
-    if message.guild is not None or message.author.bot:
-        return
+class AnonButton(discord.ui.View):
+    """The one button the bot keeps at the bottom of the channel.
 
-    if _relay_channel is None:
-        await _receipt(message, TEXT_UNAVAILABLE)
-        return
+    Persistent: no timeout and a fixed custom_id, and registered with the
+    client at startup, so a button left over from an earlier run still opens
+    the form.
+    """
 
-    if _paused:
-        _count("rejected_paused")
-        await _receipt(message, TEXT_PAUSED)
-        return
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
 
-    if message.attachments or message.stickers:
-        _count("rejected_attachment")
-        await _receipt(message, TEXT_NO_ATTACHMENTS)
-        return
-
-    content = message.content.strip()
-    if not content:
-        _count("rejected_empty")
-        await _receipt(message, TEXT_EMPTY)
-        return
-
-    if len(content) > MAX_MESSAGE_CHARS:
-        _count("rejected_too_long")
-        await _receipt(message, TEXT_TOO_LONG.format(actual=len(content), limit=MAX_MESSAGE_CHARS))
-        return
-
-    if REQUIRE_MEMBERSHIP and not await _is_current_member(message.author.id):
-        _count("rejected_not_member")
-        await _receipt(message, TEXT_NOT_MEMBER)
-        return
-
-    if not _rate_limiter.take():
-        _count("rejected_rate_limited")
-        await _receipt(message, TEXT_RATE_LIMITED)
-        return
-
-    # Dealt after every other check so a refused message never takes a
-    # number. See the Numbering section for what this does with the sender.
-    tag = _numbering.tag(message.author.id)
-    if tag is None:
-        _count("rejected_no_numbers")
-        await _receipt(message, TEXT_NO_NUMBERS)
-        return
-
-    # From here on, only `tag` and `content` are in play. Nothing downstream
-    # of this point has access to the sender.
-    # Posted as plain text under the day's number. suppress_embeds stops links
-    # unfurling into preview cards, so a post appears exactly as it was typed
-    # and nothing else.
-    #
-    # allowed_mentions is the ONLY thing stopping a submission containing
-    # @everyone from notifying the whole server. Discord enforces it server
-    # side, so it holds regardless of what the text says - but remove it and
-    # the relay becomes a mass-ping button for anyone who wants one.
-    try:
-        await _relay_channel.send(
-            f"**{tag}**\n{content}",
-            allowed_mentions=discord.AllowedMentions.none(),
-            suppress_embeds=True,
-        )
-    except discord.HTTPException:
-        _count("relay_failed")
-        await _receipt(message, TEXT_FAILED)
-        return
-
-    _count("relayed")
-    await _receipt(message, TEXT_DELIVERED.format(tag=tag))
+    @discord.ui.button(label=TEXT_BUTTON_LABEL, style=discord.ButtonStyle.primary, custom_id="anonbot:post")
+    async def post(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AnonForm())
 
 
 @client.event
 async def on_ready() -> None:
-    global _relay_channel, _guild, _started
+    global _relay_channel, _started
 
     try:
-        _guild = await client.fetch_guild(GUILD_ID)
         channel = await client.fetch_channel(CHANNEL_ID)
     except discord.HTTPException:
-        emit("startup: could not resolve the guild or the relay channel")
+        emit("startup: could not resolve the relay channel")
         return
 
     # Halting here rather than calling sys.exit(): this runs on an event task,
@@ -428,15 +462,17 @@ async def on_ready() -> None:
         guild = discord.Object(id=GUILD_ID)
         tree.copy_global_to(guild=guild)
         await tree.sync(guild=guild)
+        client.add_view(AnonButton())
         _midnight.start()
         await _announce_reshuffle()
+        await _place_button()
         _started = True
 
     emit(f"ready, build {BUILD_SHA}")
 
 
 # --------------------------------------------------------------------------
-# Moderator commands
+# Moderation and status
 # --------------------------------------------------------------------------
 
 
@@ -450,7 +486,7 @@ def _is_moderator(interaction: discord.Interaction) -> bool:
 async def pause(interaction: discord.Interaction) -> None:
     global _paused
     if not _is_moderator(interaction):
-        await interaction.response.send_message("Moderators only.", ephemeral=True)
+        await _whisper(interaction, "Moderators only.")
         return
     _paused = True
     emit("relay paused")
@@ -462,7 +498,7 @@ async def pause(interaction: discord.Interaction) -> None:
 async def resume(interaction: discord.Interaction) -> None:
     global _paused
     if not _is_moderator(interaction):
-        await interaction.response.send_message("Moderators only.", ephemeral=True)
+        await _whisper(interaction, "Moderators only.")
         return
     _paused = False
     emit("relay resumed")
@@ -473,20 +509,10 @@ async def resume(interaction: discord.Interaction) -> None:
 async def status(interaction: discord.Interaction) -> None:
     state = "paused" if _paused else "running"
     tally = ", ".join(f"{k}: {v}" for k, v in sorted(COUNTS.items())) or "nothing yet"
-    await interaction.response.send_message(
+    await _whisper(
+        interaction,
         f"Relay is **{state}**.\nSince the last restart - {tally}.\n"
         "These are totals only. No per-person figures exist to report.",
-        ephemeral=True,
-    )
-
-
-@tree.command(name="attest", description="Show which build of the source this bot is running.")
-async def attest(interaction: discord.Interaction) -> None:
-    await interaction.response.send_message(
-        f"Source: {BUILD_SOURCE}\n"
-        f"Commit: `{BUILD_SHA}`\n\n"
-        "This is self-reported, so it proves nothing on its own. Check the "
-        "source at that link if you actually care."
     )
 
 

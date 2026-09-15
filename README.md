@@ -1,13 +1,13 @@
 # anonbot
 
-DM the bot, it posts what you said in #anon as `Human 042`. Same number all
-day, new number tomorrow. That's the whole bot.
+Tap the button in #anon, a box pops up, what you write in it appears as
+`Human 042`. Same number all day, new number tomorrow. That's the whole bot.
 
 No database, no logs, one file. If you don't believe it, read it.
 
-One thing worth knowing before you use it: Discord still has your DMs.
-Anonymous to the server is not the same as anonymous to Discord. Act
-accordingly.
+One thing worth knowing before you use it: Discord still sees what you
+submit. Anonymous to the server is not the same as anonymous to Discord.
+Act accordingly.
 
 ## Setup
 
@@ -15,14 +15,21 @@ accordingly.
 
 - **Public Bot: off**
 - **Message Content Intent: off** — it doesn't need it, and turning it on gives
-  the bot the ability to read every channel in your server
+  the bot the ability to read every channel in your server. It doesn't ask
+  for any message intent at all: Discord never sends it a message from anyone,
+  in a channel or a DM. The button is the only way in.
 - copy the token
 
 **2.** Invite it with scopes `bot` and `applications.commands`, and exactly
 two permissions: **View Channel** and **Send Messages**.
 
-**3.** In `#anon`, deny **Send Messages** for `@everyone` so nobody fires one
-off under their own name by accident.
+**3.** In `#anon`, deny **Send Messages** for `@everyone`, then add the bot's
+role to the channel with **Send Messages** allowed. The second half matters: a
+deny on `@everyone` applies to the bot too unless its role gets its own
+allow. The channel is read-only on purpose: there's no text box to fire
+something off under your own name by accident, and Discord won't let a slash
+command run there either. The bot keeps a button at the bottom, and that's
+how people post.
 
 **4.** Fill in `.env` and start it:
 
@@ -45,16 +52,16 @@ server and channel IDs.
 | `MAX_MESSAGE_CHARS` | `2000` | Longest message it'll accept. Capped at 1986 so the number line fits |
 | `RATE_LIMIT_BURST` | `5` | Messages back to back, whole server |
 | `RATE_LIMIT_PER_MINUTE` | `12` | Sustained rate, whole server |
-| `REQUIRE_GUILD_MEMBERSHIP` | `true` | Ignore people who left the server |
 
 ## Commands
+
+Posting isn't a command. It's the button.
 
 | Command | Who | What |
 |---|---|---|
 | `/pause` | mods | Stop relaying. Messages get refused, not queued. |
 | `/resume` | mods | Start again. |
 | `/status` | anyone | Message counts since last restart. Totals only. |
-| `/attest` | anyone | Which commit it's running. |
 
 ## Numbers
 
@@ -84,11 +91,14 @@ What that means in practice:
 
 ## Things it doesn't do
 
-- **Attachments.** Text only. Images carry metadata that identifies you.
-- **Queue anything while it's down.** No reply from the bot means it didn't post.
+- **Attachments.** The box takes text. Images carry metadata that identifies you.
+- **Read DMs.** It doesn't ask Discord for them, so a DM to it goes nowhere.
+- **Queue anything while it's down.** If it didn't appear in the channel, it
+  didn't post.
 - **Let mods ban a sender.** There's nothing to ban, and a number isn't a
   person. Delete the message and `/pause` if someone's being a dick.
 - **Per-person rate limits.** One bucket for the whole server, because a
-  per-person limit means keeping track of people.
+  per-person limit means keeping track of people. If a mod needs to cut one
+  person off, hiding `#anon` from a role does it, and the bot never knows.
 - **Remember you past midnight UTC.** The number table and the secret behind
   it are thrown away every day and on every restart.

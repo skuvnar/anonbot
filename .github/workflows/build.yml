@@ -38,7 +38,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: |
             GIT_SHA=${{ github.sha }}
-            SOURCE_URL=https://github.com/${{ github.repository }}
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
