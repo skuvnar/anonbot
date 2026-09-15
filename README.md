@@ -31,7 +31,13 @@ something off under your own name by accident, and Discord won't let a slash
 command run there either. The bot keeps a button at the bottom, and that's
 how people post.
 
-**4.** Fill in `.env` and start it:
+**4.** Still in `#anon`: Edit Channel → Integrations → Webhooks → New Webhook.
+Name it anything, copy the webhook URL. Posts go out through it, which is
+what puts `Human 042` where the author's name goes instead of the bot's.
+Anyone with that URL can post to the channel as anyone, so keep it with the
+token.
+
+**5.** Fill in `.env` and start it:
 
 ```
 cp .env.example .env
@@ -49,7 +55,8 @@ server and channel IDs.
 | `DISCORD_TOKEN` | required | Bot token |
 | `ANON_GUILD_ID` | required | Server it posts to |
 | `ANON_CHANNEL_ID` | required | Channel it posts to |
-| `MAX_MESSAGE_CHARS` | `2000` | Longest message it'll accept. Capped at 1986 so the number line fits |
+| `ANON_WEBHOOK_URL` | required | Webhook in that channel. Posts go out through it |
+| `MAX_MESSAGE_CHARS` | `2000` | Longest message it'll accept |
 | `RATE_LIMIT_BURST` | `5` | Messages back to back, whole server |
 | `RATE_LIMIT_PER_MINUTE` | `12` | Sustained rate, whole server |
 
@@ -65,7 +72,7 @@ Posting isn't a command. It's the button.
 
 ## Numbers
 
-Every post is signed `Human 042`. Same person, same number, until midnight
+Every post shows up from `Human 042`. Same person, same number, until midnight
 UTC. Then the deck is reshuffled, the bot says so in the channel, and
 yesterday's Human 042 is nobody in particular. A restart reshuffles too, and
 the bot announces that the same way.

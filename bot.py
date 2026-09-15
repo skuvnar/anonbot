@@ -35,7 +35,6 @@ from discord.ext import tasks
 # handler below stays short enough to read in one pass.
 # --------------------------------------------------------------------------
 
-TEXT_BUTTON_PROMPT = "The channel is read-only. Use the button."
 TEXT_BUTTON_LABEL = "Post anonymously"
 TEXT_FORM_TITLE = "Post anonymously"
 TEXT_FORM_LABEL = "Your message"
@@ -85,12 +84,17 @@ TOKEN = _require("DISCORD_TOKEN")
 GUILD_ID = _require_id("ANON_GUILD_ID")
 CHANNEL_ID = _require_id("ANON_CHANNEL_ID")
 
-# Discord caps a bot's message content at 2000 characters, and every post
-# spends a few of those on its "Human 042" line. The form below refuses to
-# submit anything longer than fits, so the limit is enforced by Discord's own
-# client before the text ever reaches this program.
-TAG_OVERHEAD = len("**Human 000**\n")
-MAX_MESSAGE_CHARS = min(_optional_int("MAX_MESSAGE_CHARS", 2000), 2000 - TAG_OVERHEAD)
+# A webhook for the relay channel, made by hand in the channel's settings.
+# Posts go out through it with the day's number as the display name, which
+# is what puts "Human 042" where an author's name goes and keeps the bot's
+# own name off every post. Anyone holding this URL can post to the channel
+# under any name, so it is a secret in the same class as the token.
+WEBHOOK_URL = _require("ANON_WEBHOOK_URL")
+
+# Discord caps a message at 2000 characters. The form below refuses anything
+# longer, so the limit is enforced by Discord's own client before the text
+# ever reaches this program.
+MAX_MESSAGE_CHARS = min(_optional_int("MAX_MESSAGE_CHARS", 2000), 2000)
 RATE_LIMIT_BURST = _optional_int("RATE_LIMIT_BURST", 5)
 RATE_LIMIT_PER_MINUTE = _optional_int("RATE_LIMIT_PER_MINUTE", 12)
 
@@ -202,8 +206,8 @@ class DailyNumbering:
         secrets.SystemRandom().shuffle(self._deck)
         self._dealt: dict[bytes, int] = {}
 
-    def tag(self, user_id: int) -> str | None:
-        """Today's label for this sender, dealing a fresh one on first sight.
+    def number(self, user_id: int) -> int | None:
+        """Today's number for this sender, dealing a fresh one on first sight.
 
         Returns None only once all thousand numbers are taken, which would
         take a thousand different senders in one day. Refusing beats clashing.
@@ -215,7 +219,7 @@ class DailyNumbering:
                 return None
             number = self._deck.pop()
             self._dealt[digest] = number
-        return f"Human {number:03d}"
+        return number
 
 
 _numbering = DailyNumbering()
@@ -248,6 +252,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 _relay_channel: discord.TextChannel | None = None
+_webhook: discord.Webhook | None = None
 _button_id: int | None = None
 _started = False
 _paused = False
@@ -307,7 +312,7 @@ async def _place_button() -> None:
         except discord.HTTPException:
             pass
     try:
-        posted = await _relay_channel.send(TEXT_BUTTON_PROMPT, view=AnonButton())
+        posted = await _relay_channel.send(view=AnonButton())
         _button_id = posted.id
     except discord.HTTPException:
         _button_id = None
@@ -354,7 +359,7 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
         except discord.HTTPException:
             return
 
-        if _relay_channel is None:
+        if _relay_channel is None or _webhook is None:
             await _whisper(interaction, TEXT_UNAVAILABLE)
             return
 
@@ -384,26 +389,30 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
 
         # Dealt after every other check so a refused message never takes a
         # number. See the Numbering section for what this does with the sender.
-        tag = _numbering.tag(interaction.user.id)
-        if tag is None:
+        number = _numbering.number(interaction.user.id)
+        if number is None:
             _count("rejected_no_numbers")
             await _whisper(interaction, TEXT_NO_NUMBERS)
             return
 
-        # From here on, only `tag` and `content` are in play. Nothing
+        # From here on, only `number` and `content` are in play. Nothing
         # downstream of this point has access to the sender.
-        # Posted as an ordinary bot message, not as a reply to the interaction,
-        # which is what keeps the sender's name off it. suppress_embeds stops
-        # links unfurling into preview cards, so a post appears exactly as it
-        # was typed and nothing else.
+        # Posted through the webhook rather than as a reply to the interaction,
+        # which is what keeps the sender's name off it. The display name is the
+        # number, and the avatar is one of Discord's six stock ones picked by
+        # number, purely so neighbouring posts look different. suppress_embeds
+        # stops links unfurling into preview cards, so a post appears exactly
+        # as it was typed and nothing else.
         #
         # allowed_mentions is the ONLY thing stopping a submission containing
         # @everyone from notifying the whole server. Discord enforces it server
         # side, so it holds regardless of what the text says - but remove it
         # and the relay becomes a mass-ping button for anyone who wants one.
         try:
-            await _relay_channel.send(
-                f"**{tag}**\n{content}",
+            await _webhook.send(
+                content,
+                username=f"Human {number:03d}",
+                avatar_url=f"https://cdn.discordapp.com/embed/avatars/{number % 6}.png",
                 allowed_mentions=discord.AllowedMentions.none(),
                 suppress_embeds=True,
             )
@@ -434,7 +443,7 @@ class AnonButton(discord.ui.View):
 
 @client.event
 async def on_ready() -> None:
-    global _relay_channel, _started
+    global _relay_channel, _webhook, _started
 
     try:
         channel = await client.fetch_channel(CHANNEL_ID)
@@ -454,7 +463,24 @@ async def on_ready() -> None:
         await client.close()
         return
 
+    # Built here rather than at import because it borrows the client's HTTP
+    # session, which only exists once logged in. A URL pasted from the wrong
+    # channel would quietly relay posts somewhere else, so it is checked
+    # against the channel before anything is sent. Fetched with the webhook's
+    # own token, which needs no extra bot permission.
+    try:
+        hook = await discord.Webhook.from_url(WEBHOOK_URL, client=client).fetch(prefer_auth=False)
+    except (ValueError, discord.HTTPException):
+        emit("startup: ANON_WEBHOOK_URL is not a usable webhook - shutting down")
+        await client.close()
+        return
+    if hook.channel_id != CHANNEL_ID:
+        emit("startup: ANON_WEBHOOK_URL does not point at ANON_CHANNEL_ID - shutting down")
+        await client.close()
+        return
+
     _relay_channel = channel
+    _webhook = hook
 
     # on_ready fires again after a reconnect. Everything that must happen
     # exactly once per process lives behind this flag.
