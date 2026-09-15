@@ -38,6 +38,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: |
             GIT_SHA=${{ github.sha }}
+            AVATAR_BASE=https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/avatars
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}

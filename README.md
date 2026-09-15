@@ -56,6 +56,7 @@ server and channel IDs.
 | `ANON_GUILD_ID` | required | Server it posts to |
 | `ANON_CHANNEL_ID` | required | Channel it posts to |
 | `ANON_WEBHOOK_URL` | required | Webhook in that channel. Posts go out through it |
+| `ANON_AVATAR_BASE` | set by the build | Where Discord fetches avatars from. Unset means the webhook's own avatar |
 | `MAX_MESSAGE_CHARS` | `2000` | Longest message it'll accept |
 | `RATE_LIMIT_BURST` | `5` | Messages back to back, whole server |
 | `RATE_LIMIT_PER_MINUTE` | `12` | Sustained rate, whole server |
@@ -72,9 +73,12 @@ Posting isn't a command. It's the button.
 
 ## Numbers
 
-Every post shows up from `Human 042`. Same person, same number, until midnight
-UTC. Then the deck is reshuffled, the bot says so in the channel, and
-yesterday's Human 042 is nobody in particular. A restart reshuffles too, and
+Every post shows up from `Human 042` with an animal for a face. Same person,
+same number, same animal, until midnight UTC. Then both decks are reshuffled,
+the bot says so in the channel, and yesterday's Human 042 is nobody in
+particular. The animals live in `avatars/`; add or remove files there and the
+next build deals from the new set. When the folder runs out for the day,
+everyone else is ProfessorDog. A restart reshuffles too, and
 the bot announces that the same way.
 
 How it recognises you without remembering you: your user ID goes through a
@@ -84,8 +88,9 @@ only as the key for looking up your number. No secret, no way back.
 
 What that means in practice:
 
-- Numbers are dealt from a shuffled deck of `000`-`999`. Nobody shares one,
-  and the number doesn't tell you who wrote first.
+- Numbers are dealt from a shuffled deck of `000`-`999`, animals from a
+  shuffled deck of the folder. Nobody shares a number, and neither tells you
+  who wrote first.
 - After midnight or a restart, nobody can recover who was who. Not the person
   running it. It's gone.
 - During the day, whoever has root on the box could dump the bot's memory,

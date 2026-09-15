@@ -9,7 +9,8 @@ If you are editing this, three rules keep it honest:
   1. No sender identifier gets stored, counted or logged. Ever. The one thing
      ever derived from one is today's number (see Numbering), keyed under a
      secret that lives in memory and dies at midnight UTC.
-  2. Nothing is written to disk. No database, no queue, no filesystem imports.
+  2. Nothing is written to disk. No database, no queue. The one thing read
+     from disk is the list of file names in avatars/, once, at startup.
   3. emit() is the only thing that prints, and it only takes fixed strings.
 
 Break one of those and it is a different bot with the same name.
@@ -23,6 +24,7 @@ import os
 import secrets
 import sys
 import time
+from urllib.parse import quote
 
 import discord
 from discord import app_commands
@@ -90,6 +92,21 @@ CHANNEL_ID = _require_id("ANON_CHANNEL_ID")
 # own name off every post. Anyone holding this URL can post to the channel
 # under any name, so it is a secret in the same class as the token.
 WEBHOOK_URL = _require("ANON_WEBHOOK_URL")
+
+# Avatars. Each Human gets a picture for the day, dealt from the avatars/
+# folder the same way numbers are. Only the file names are read, once, here;
+# the pictures themselves are fetched by Discord's servers from
+# ANON_AVATAR_BASE, which the build sets to this repository's copy of the
+# folder at the exact commit the image was built from. Nobody's client ever
+# touches that host. Leave ANON_AVATAR_BASE unset and posts simply use the
+# webhook's own avatar. Once the folder runs out for the day, everyone else
+# gets DEFAULT_AVATAR.
+AVATAR_BASE = os.environ.get("ANON_AVATAR_BASE", "").strip().rstrip("/")
+try:
+    AVATARS = sorted(name for name in os.listdir("avatars") if not name.startswith("."))
+except FileNotFoundError:
+    AVATARS = []
+DEFAULT_AVATAR = "ProfessorDog.jpg"
 
 # Discord caps a message at 2000 characters. The form below refuses anything
 # longer, so the limit is enforced by Discord's own client before the text
@@ -166,10 +183,11 @@ _rate_limiter = GlobalRateLimiter(RATE_LIMIT_BURST, RATE_LIMIT_PER_MINUTE)
 # --------------------------------------------------------------------------
 # Numbering
 #
-# Every post is signed "Human 042" so readers can tell one sender's messages
-# apart from another's within a day, and nothing more. The number says
-# nothing about who you are: it is dealt from a shuffled deck of 000-999, so
-# no two people share one, and it does not even reveal who wrote first.
+# Every post is signed "Human 042", with a picture, so readers can tell one
+# sender's messages apart from another's within a day, and nothing more.
+# Neither says anything about who you are: both are dealt from shuffled
+# decks, so no two people share a number, and neither reveals who wrote
+# first.
 #
 # Handing you the same number on your second message means recognising you,
 # and that is the one place this program touches a sender identifier. It is
@@ -195,31 +213,36 @@ _rate_limiter = GlobalRateLimiter(RATE_LIMIT_BURST, RATE_LIMIT_PER_MINUTE)
 
 
 class DailyNumbering:
-    """The day's secret, the deck, and the numbers dealt so far."""
+    """The day's secret, the two decks, and what has been dealt so far."""
 
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
         self._secret = secrets.token_bytes(32)
-        self._deck = list(range(1000))
-        secrets.SystemRandom().shuffle(self._deck)
-        self._dealt: dict[bytes, int] = {}
+        self._numbers = list(range(1000))
+        self._avatars = list(AVATARS)
+        rng = secrets.SystemRandom()
+        rng.shuffle(self._numbers)
+        rng.shuffle(self._avatars)
+        self._dealt: dict[bytes, tuple[int, str]] = {}
 
-    def number(self, user_id: int) -> int | None:
-        """Today's number for this sender, dealing a fresh one on first sight.
+    def deal(self, user_id: int) -> tuple[int, str] | None:
+        """Today's number and avatar for this sender, dealt on first sight.
 
         Returns None only once all thousand numbers are taken, which would
         take a thousand different senders in one day. Refusing beats clashing.
+        The avatars run out far sooner; from then on it is DEFAULT_AVATAR.
         """
         digest = hmac.digest(self._secret, str(user_id).encode(), "sha256")
-        number = self._dealt.get(digest)
-        if number is None:
-            if not self._deck:
+        hand = self._dealt.get(digest)
+        if hand is None:
+            if not self._numbers:
                 return None
-            number = self._deck.pop()
-            self._dealt[digest] = number
-        return number
+            avatar = self._avatars.pop() if self._avatars else DEFAULT_AVATAR
+            hand = (self._numbers.pop(), avatar)
+            self._dealt[digest] = hand
+        return hand
 
 
 _numbering = DailyNumbering()
@@ -389,20 +412,20 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
 
         # Dealt after every other check so a refused message never takes a
         # number. See the Numbering section for what this does with the sender.
-        number = _numbering.number(interaction.user.id)
-        if number is None:
+        hand = _numbering.deal(interaction.user.id)
+        if hand is None:
             _count("rejected_no_numbers")
             await _whisper(interaction, TEXT_NO_NUMBERS)
             return
+        number, avatar = hand
 
-        # From here on, only `number` and `content` are in play. Nothing
-        # downstream of this point has access to the sender.
+        # From here on, only `number`, `avatar` and `content` are in play.
+        # Nothing downstream of this point has access to the sender.
         # Posted through the webhook rather than as a reply to the interaction,
         # which is what keeps the sender's name off it. The display name is the
-        # number, and the avatar is one of Discord's six stock ones picked by
-        # number, purely so neighbouring posts look different. suppress_embeds
-        # stops links unfurling into preview cards, so a post appears exactly
-        # as it was typed and nothing else.
+        # number and the picture is the day's avatar. suppress_embeds stops
+        # links unfurling into preview cards, so a post appears exactly as it
+        # was typed and nothing else.
         #
         # allowed_mentions is the ONLY thing stopping a submission containing
         # @everyone from notifying the whole server. Discord enforces it server
@@ -412,7 +435,7 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
             await _webhook.send(
                 content,
                 username=f"Human {number:03d}",
-                avatar_url=f"https://cdn.discordapp.com/embed/avatars/{number % 6}.png",
+                avatar_url=f"{AVATAR_BASE}/{quote(avatar)}" if AVATAR_BASE else discord.utils.MISSING,
                 allowed_mentions=discord.AllowedMentions.none(),
                 suppress_embeds=True,
             )
