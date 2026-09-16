@@ -325,6 +325,7 @@ _relay_channel: discord.TextChannel | None = None
 _webhook: discord.Webhook | None = None
 _button_id: int | None = None
 _button_lock = asyncio.Lock()
+BUTTON_TIMEOUT = 30  # seconds to wait on Discord before a placement counts as failed
 _started = False
 _paused = False
 
@@ -379,18 +380,34 @@ async def _place_button() -> None:
         return
     # Two posts landing in the same instant would otherwise both delete the
     # same old button and both post a new one, leaving one orphaned forever.
+    # The timeout stops a hung request at Discord's end from holding that
+    # lock for good; a placement that fails or times out is forgotten and
+    # the keeper below tries again.
     async with _button_lock:
-        if _button_id is not None:
-            try:
-                await _relay_channel.get_partial_message(_button_id).delete()
-            except discord.HTTPException:
-                pass
         try:
-            posted = await _relay_channel.send(view=AnonButton())
+            async with asyncio.timeout(BUTTON_TIMEOUT):
+                if _button_id is not None:
+                    try:
+                        await _relay_channel.get_partial_message(_button_id).delete()
+                    except discord.HTTPException:
+                        pass
+                posted = await _relay_channel.send(view=AnonButton())
             _button_id = posted.id
-        except discord.HTTPException:
+        except (discord.HTTPException, TimeoutError):
             _button_id = None
-            emit("could not post the button - does the bot have Send Messages in the relay channel?")
+            emit("could not post the button - Discord refused it, timed out, or the bot lacks Send Messages")
+
+
+@tasks.loop(minutes=2)
+async def _keeper() -> None:
+    """Put the button back if a placement failed.
+
+    A bad minute at Discord's end during a post would otherwise leave the
+    channel with no button, and so no way to post, until midnight or a
+    restart. Nothing to do while the button is known to be there.
+    """
+    if _button_id is None:
+        await _place_button()
 
 
 @tasks.loop(time=datetime.time(hour=0, tzinfo=datetime.timezone.utc))
@@ -571,6 +588,7 @@ async def on_ready() -> None:
         _midnight.start()
         await _announce_reshuffle()
         await _place_button()
+        _keeper.start()
         _started = True
 
     emit(f"ready, build {BUILD_SHA}")
