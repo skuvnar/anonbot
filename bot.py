@@ -22,6 +22,7 @@ import asyncio
 import datetime
 import hmac
 import os
+import re
 import secrets
 import sys
 import time
@@ -83,6 +84,17 @@ def _optional_int(name: str, default: int) -> int:
         sys.exit(f"[anonbot] {name} must be an integer")
 
 
+def _optional_pairs(name: str) -> dict[str, int]:
+    """Parse `name:id,name:id` into a dict. Unset means empty."""
+    pairs: dict[str, int] = {}
+    for item in filter(None, (s.strip() for s in os.environ.get(name, "").split(","))):
+        label, sep, ident = item.rpartition(":")
+        if not sep or not label or not ident.isdigit():
+            sys.exit(f"[anonbot] {name} entries must look like name:id")
+        pairs[label] = int(ident)
+    return pairs
+
+
 TOKEN = _require("DISCORD_TOKEN")
 GUILD_ID = _require_id("ANON_GUILD_ID")
 CHANNEL_ID = _require_id("ANON_CHANNEL_ID")
@@ -108,6 +120,40 @@ try:
 except FileNotFoundError:
     AVATARS = []
 DEFAULT_AVATAR = "ProfessorDog.jpg"
+
+# Pings. @everyone and @here go through on purpose. Any other @someone is
+# sent as plain text and wakes nobody: an anonymous ping aimed at a person is
+# the one thing this relay refuses to carry. The exception is the names
+# listed here, which exist so a server can make a bot of its own summonable.
+# Entries are name:id - the name is what people type after an @, the id is
+# what Discord needs. Text from the form carries no mention markup, so the
+# bot rewrites @name and @name#0000 into a real mention for these names only.
+# A name listed under both goes to the user.
+PING_USERS = _optional_pairs("ANON_PING_USERS")
+PING_ROLES = _optional_pairs("ANON_PING_ROLES")
+
+MENTIONS = discord.AllowedMentions(
+    everyone=True,
+    users=[discord.Object(id=i) for i in PING_USERS.values()],
+    roles=[discord.Object(id=i) for i in PING_ROLES.values()],
+    replied_user=False,
+)
+
+_PING_PATTERNS = [
+    (re.compile(rf"(?<!\w)@{re.escape(n)}(?:#\d{{4}})?(?![\w#])", re.IGNORECASE), f"<@{i}>")
+    for n, i in PING_USERS.items()
+] + [
+    (re.compile(rf"(?<!\w)@{re.escape(n)}(?![\w#])", re.IGNORECASE), f"<@&{i}>")
+    for n, i in PING_ROLES.items()
+]
+
+
+def _link_pings(text: str) -> str:
+    """Turn @name for the listed names into real mentions, nothing else."""
+    for pattern, markup in _PING_PATTERNS:
+        text = pattern.sub(markup, text)
+    return text
+
 
 # Discord caps a message at 2000 characters. The form below refuses anything
 # longer, so the limit is enforced by Discord's own client before the text
@@ -404,7 +450,7 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
             await _whisper(interaction, TEXT_PAUSED)
             return
 
-        content = self.field.component.value.strip()
+        content = _link_pings(self.field.component.value.strip())
         if not content:
             _count("rejected_empty")
             await _whisper(interaction, TEXT_EMPTY)
@@ -436,16 +482,16 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
         # button is moved below it. Without it the request is merely accepted,
         # and the button can land first.
         #
-        # allowed_mentions is the ONLY thing stopping a submission containing
-        # @everyone from notifying the whole server. Discord enforces it server
-        # side, so it holds regardless of what the text says - but remove it
-        # and the relay becomes a mass-ping button for anyone who wants one.
+        # MENTIONS decides who a post can wake: everyone, plus the listed
+        # names that _link_pings turned into real mentions above. Discord
+        # enforces the list server side, so an @someone that is not on it
+        # stays plain text no matter what the post contains.
         try:
             await _webhook.send(
                 content,
                 username=f"Human {number:03d}",
                 avatar_url=f"{AVATAR_BASE}/{quote(avatar)}" if AVATAR_BASE else discord.utils.MISSING,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=MENTIONS,
                 suppress_embeds=True,
                 wait=True,
             )

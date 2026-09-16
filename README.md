@@ -57,6 +57,8 @@ server and channel IDs.
 | `ANON_CHANNEL_ID` | required | Channel it posts to |
 | `ANON_WEBHOOK_URL` | required | Webhook in that channel. Posts go out through it |
 | `ANON_AVATAR_BASE` | set by the build | Where Discord fetches avatars from. Unset means the webhook's own avatar |
+| `ANON_PING_USERS` | none | `name:id` pairs people may ping by typing `@name`. For summoning your own bots |
+| `ANON_PING_ROLES` | none | Same, for roles |
 | `MAX_MESSAGE_CHARS` | `2000` | Longest message it'll accept |
 | `RATE_LIMIT_BURST` | `5` | Messages back to back, whole server |
 | `RATE_LIMIT_PER_MINUTE` | `12` | Sustained rate, whole server |
@@ -103,6 +105,9 @@ What that means in practice:
 
 ## Things it doesn't do
 
+- **Ping people.** `@everyone` and `@here` go through, on purpose. Any other
+  `@someone` is plain text and wakes nobody, unless their name is listed in
+  `ANON_PING_USERS`, which exists so you can make a bot of yours summonable.
 - **Attachments.** The box takes text. Images carry metadata that identifies you.
 - **Read DMs.** It doesn't ask Discord for them, so a DM to it goes nowhere.
 - **Queue anything while it's down.** If it didn't appear in the channel, it
