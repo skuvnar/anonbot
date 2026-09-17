@@ -1,17 +1,42 @@
 """
-audit this by just reading it, its like 400 lines and most of them are comments.
-or paste it into chatgpt and ask it if it keeps any logs. who cares nerds idgaf
+audit this by just reading it. its about 800 lines and most of them are comments.
+or paste it into chatgpt and ask it what it keeps. who cares nerds idgaf
 
 ---
+
+What this program holds. All of it is in memory and all of it is gone on
+restart:
+
+  - today's secret, and a table from a keyed hash of each sender to the
+    number and avatar they were dealt. Thrown away and re-dealt at midnight
+    UTC. See Numbering.
+  - the numbers silenced today. Numbers, not people. Thrown away with the
+    table.
+  - the id of its own button message, one shared rate-limit bucket, and
+    running totals of how many posts were relayed or refused.
+
+What it never holds: a sender's id outside that keyed hash, anything a sender
+wrote once it has been posted, or any record of who pressed what.
+
+What it writes to disk: nothing. What it reads from disk: the file names in
+avatars/, once, at startup. What it prints: fixed strings through emit(),
+which name no person, no number and no message. Whether those lines are kept
+is up to whoever runs it; the shipped compose file throws them away, which is
+also why diagnosing it means reading the channel rather than a log. An
+unexpected crash inside the library would print a Python traceback, which
+names code, not people.
+
+What it can do nothing about: Discord sees every press and every word, and
+root on the host can read this process's memory while it runs.
 
 If you are editing this, three rules keep it honest:
 
   1. No sender identifier gets stored, counted or logged. Ever. The one thing
-     ever derived from one is today's number (see Numbering), keyed under a
-     secret that lives in memory and dies at midnight UTC.
-  2. Nothing is written to disk. No database, no queue. The one thing read
-     from disk is the list of file names in avatars/, once, at startup.
+     ever derived from one is the keyed hash above, under a secret that lives
+     in memory and dies at midnight UTC.
+  2. Nothing is written to disk. No database, no queue.
   3. emit() is the only thing that prints, and it only takes fixed strings.
+     The one exception is the commit hash on the startup line.
 
 Break one of those and it is a different bot with the same name.
 """
@@ -50,9 +75,19 @@ TEXT_WRONG_SERVER = "This only works in the server it posts to."
 TEXT_NO_NUMBERS = "Every number for today has been dealt. Try again after midnight UTC."
 TEXT_FAILED = "Discord rejected the post, so it did not go through. Try again."
 TEXT_UNAVAILABLE = "The relay channel is not reachable right now. Your message was not posted."
+TEXT_SILENCED = "You were silenced until midnight UTC. Don't be an asshat."
+
+# Replies to whoever runs /silence or /unsilence.
+TEXT_SILENCE_DENIED = "Pest control only."
+TEXT_SILENCE_NOBODY = "Nobody is Human {number:03d} today."
+TEXT_SILENCE_DONE = "Human {number:03d} is silenced until midnight UTC."
+TEXT_UNSILENCE_DONE = "Human {number:03d} can post again."
+TEXT_UNSILENCE_NOT = "Human {number:03d} was not silenced."
 
 # Posted in the relay channel itself, not to a sender.
 TEXT_RESHUFFLED = "Numbers reshuffled. Any Human above this line is unrelated to any Human below it."
+TEXT_SILENCED_NOTICE = "Human {number:03d} has been silenced until midnight UTC."
+TEXT_UNSILENCED_NOTICE = "Human {number:03d} can post again."
 
 
 # --------------------------------------------------------------------------
@@ -69,6 +104,15 @@ def _require(name: str) -> str:
 
 def _require_id(name: str) -> int:
     raw = _require(name)
+    if not raw.isdigit():
+        sys.exit(f"[anonbot] {name} must be a numeric Discord ID")
+    return int(raw)
+
+
+def _optional_id(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
     if not raw.isdigit():
         sys.exit(f"[anonbot] {name} must be a numeric Discord ID")
     return int(raw)
@@ -120,6 +164,10 @@ try:
 except FileNotFoundError:
     AVATARS = []
 DEFAULT_AVATAR = "ProfessorDog.jpg"
+
+# The role whose holders may silence a Human for the rest of the day. Unset
+# means nobody can. What a silence is, and is not, is set out under Numbering.
+SILENCE_ROLE_ID = _optional_id("ANON_SILENCE_ROLE_ID")
 
 # Pings. @everyone and @here go through on purpose. Any other @someone is
 # sent as plain text and wakes nobody: an anonymous ping aimed at a person is
@@ -256,6 +304,16 @@ _rate_limiter = GlobalRateLimiter(RATE_LIMIT_BURST, RATE_LIMIT_PER_MINUTE)
 #   - A number is a trail. Everything under "Human 042" can be read together
 #     for a day, and writing style or posting times can give people away.
 #     The midnight reset is what keeps the trail short.
+#
+# Silencing. A holder of the configured role can silence a number until the
+# reset. What is kept is the number, which everyone can already see, never
+# the person: the check asks "is this sender's number for today on the
+# list", using the same keyed hash as above. It cannot be dodged within the
+# day, because the number follows the hash, and it cannot outlive the day,
+# because the hash does not. The bot tells nobody who was silenced. It is
+# still the one thing here that treats senders differently, so it creates a
+# fact a person can give away about themselves: say "it told me I'm
+# silenced" and you have said which Human you were.
 # --------------------------------------------------------------------------
 
 
@@ -273,6 +331,10 @@ class DailyNumbering:
         rng.shuffle(self._numbers)
         rng.shuffle(self._avatars)
         self._dealt: dict[bytes, tuple[int, str]] = {}
+        self._silenced: set[int] = set()
+
+    def _digest(self, user_id: int) -> bytes:
+        return hmac.digest(self._secret, str(user_id).encode(), "sha256")
 
     def deal(self, user_id: int) -> tuple[int, str] | None:
         """Today's number and avatar for this sender, dealt on first sight.
@@ -281,7 +343,7 @@ class DailyNumbering:
         take a thousand different senders in one day. Refusing beats clashing.
         The avatars run out far sooner; from then on it is DEFAULT_AVATAR.
         """
-        digest = hmac.digest(self._secret, str(user_id).encode(), "sha256")
+        digest = self._digest(user_id)
         hand = self._dealt.get(digest)
         if hand is None:
             if not self._numbers:
@@ -290,6 +352,32 @@ class DailyNumbering:
             hand = (self._numbers.pop(), avatar)
             self._dealt[digest] = hand
         return hand
+
+    def silence(self, number: int) -> bool:
+        """Silence a number until the reset. False if nobody holds it today.
+
+        An undealt number is refused because silencing it would land on
+        whoever happens to draw it next.
+        """
+        if not any(dealt == number for dealt, _ in self._dealt.values()):
+            return False
+        self._silenced.add(number)
+        return True
+
+    def unsilence(self, number: int) -> bool:
+        """Lift a silence. False if the number was not silenced."""
+        if number not in self._silenced:
+            return False
+        self._silenced.discard(number)
+        return True
+
+    def is_silenced(self, user_id: int) -> bool:
+        """Whether this sender's number for today is silenced.
+
+        Looks the sender up without dealing, so asking costs nobody a number.
+        """
+        hand = self._dealt.get(self._digest(user_id))
+        return hand is not None and hand[0] in self._silenced
 
 
 _numbering = DailyNumbering()
@@ -350,17 +438,17 @@ async def _whisper(interaction: discord.Interaction, text: str) -> None:
         pass
 
 
-async def _announce_reshuffle() -> None:
-    """Tell the channel that every number has just changed hands.
+async def _announce(text: str) -> None:
+    """Post a notice from the bot itself in the relay channel.
 
-    Posted at midnight UTC, and once at startup because a restart deals a
-    new deck too. A failed post is not retried: readers will notice the
-    numbers changed, and there is nothing worth recording about the failure.
+    Used for the reshuffle at midnight UTC and at startup, because a restart
+    deals a new deck too, and for silences. A failed post is not retried:
+    there is nothing worth recording about the failure.
     """
     if _relay_channel is None:
         return
     try:
-        await _relay_channel.send(TEXT_RESHUFFLED, allowed_mentions=discord.AllowedMentions.none())
+        await _relay_channel.send(text, allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException:
         pass
 
@@ -414,7 +502,7 @@ async def _keeper() -> None:
 async def _midnight() -> None:
     _numbering.reset()
     emit("midnight UTC, numbers reshuffled")
-    await _announce_reshuffle()
+    await _announce(TEXT_RESHUFFLED)
     await _place_button()
 
 
@@ -465,6 +553,13 @@ class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
         if _paused:
             _count("rejected_paused")
             await _whisper(interaction, TEXT_PAUSED)
+            return
+
+        # Checked before the rate limiter, so a silenced sender hammering the
+        # form cannot drain the bucket everyone else shares.
+        if _numbering.is_silenced(interaction.user.id):
+            _count("rejected_silenced")
+            await _whisper(interaction, TEXT_SILENCED)
             return
 
         content = _link_pings(self.field.component.value.strip())
@@ -586,7 +681,7 @@ async def on_ready() -> None:
         await tree.sync(guild=guild)
         client.add_view(AnonButton())
         _midnight.start()
-        await _announce_reshuffle()
+        await _announce(TEXT_RESHUFFLED)
         await _place_button()
         _keeper.start()
         _started = True
@@ -626,6 +721,42 @@ async def resume(interaction: discord.Interaction) -> None:
     _paused = False
     emit("relay resumed")
     await interaction.response.send_message("Relay resumed.")
+
+
+def _may_silence(interaction: discord.Interaction) -> bool:
+    # Only a Member has get_role; a bare User, as in a DM, does not.
+    role_of = getattr(interaction.user, "get_role", None)
+    return SILENCE_ROLE_ID is not None and role_of is not None and role_of(SILENCE_ROLE_ID) is not None
+
+
+@tree.command(name="silence", description="Silence a Human until midnight UTC.")
+@app_commands.describe(human="The number after Human, e.g. 42 for Human 042")
+async def silence(interaction: discord.Interaction, human: app_commands.Range[int, 0, 999]) -> None:
+    if not _may_silence(interaction):
+        await _whisper(interaction, TEXT_SILENCE_DENIED)
+        return
+    if not _numbering.silence(human):
+        await _whisper(interaction, TEXT_SILENCE_NOBODY.format(number=human))
+        return
+    emit("a human was silenced")
+    await _whisper(interaction, TEXT_SILENCE_DONE.format(number=human))
+    await _announce(TEXT_SILENCED_NOTICE.format(number=human))
+    await _place_button()
+
+
+@tree.command(name="unsilence", description="Lift a silence before midnight UTC.")
+@app_commands.describe(human="The number after Human, e.g. 42 for Human 042")
+async def unsilence(interaction: discord.Interaction, human: app_commands.Range[int, 0, 999]) -> None:
+    if not _may_silence(interaction):
+        await _whisper(interaction, TEXT_SILENCE_DENIED)
+        return
+    if not _numbering.unsilence(human):
+        await _whisper(interaction, TEXT_UNSILENCE_NOT.format(number=human))
+        return
+    emit("a silence was lifted")
+    await _whisper(interaction, TEXT_UNSILENCE_DONE.format(number=human))
+    await _announce(TEXT_UNSILENCED_NOTICE.format(number=human))
+    await _place_button()
 
 
 @tree.command(name="status", description="Show relay throughput since the last restart.")

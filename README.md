@@ -59,6 +59,7 @@ server and channel IDs.
 | `ANON_AVATAR_BASE` | set by the build | Where Discord fetches avatars from. Unset means the webhook's own avatar |
 | `ANON_PING_USERS` | none | `name:id` pairs people may ping by typing `@name`. For summoning your own bots |
 | `ANON_PING_ROLES` | none | Same, for roles |
+| `ANON_SILENCE_ROLE_ID` | none | Role whose holders can `/silence` a Human for the day. Unset means nobody can |
 | `MAX_MESSAGE_CHARS` | `2000` | Longest message it'll accept |
 | `RATE_LIMIT_BURST` | `5` | Messages back to back, whole server |
 | `RATE_LIMIT_PER_MINUTE` | `12` | Sustained rate, whole server |
@@ -71,6 +72,8 @@ Posting isn't a command. It's the button.
 |---|---|---|
 | `/pause` | mods | Stop relaying. Messages get refused, not queued. |
 | `/resume` | mods | Start again. |
+| `/silence` | silence role | Cut a Human off until midnight UTC. The channel is told which number, never who. |
+| `/unsilence` | silence role | Undo that, for when you typed the wrong number. |
 | `/status` | anyone | Message counts since last restart. Totals only. |
 
 ## Numbers
@@ -98,6 +101,10 @@ What that means in practice:
 - During the day, whoever has root on the box could dump the bot's memory,
   take the secret, and work it out. They could also just edit the bot to log
   everything. That's the same trust you were already extending, not a new one.
+- A silence is kept as a number, which everyone can already see, never as a
+  person. It can't be dodged within the day and can't outlive it. The bot
+  tells nobody who was silenced, so the only way that gets out is the person
+  saying so: "it told me I'm silenced" is telling people which Human you were.
 - A number is a trail. For one day, everything under it can be read together,
   and how you write or when you post can give you away. The reset keeps the
   trail short. Don't say anything under a number that you wouldn't want joined
@@ -112,8 +119,9 @@ What that means in practice:
 - **Read DMs.** It doesn't ask Discord for them, so a DM to it goes nowhere.
 - **Queue anything while it's down.** If it didn't appear in the channel, it
   didn't post.
-- **Let mods ban a sender.** There's nothing to ban, and a number isn't a
-  person. Delete the message and `/pause` if someone's being a dick.
+- **Ban anyone for longer than a day.** `/silence` works on a number, and
+  numbers are reshuffled at midnight. There's still no person to ban. For
+  anything worse, delete the message and `/pause`.
 - **Per-person rate limits.** One bucket for the whole server, because a
   per-person limit means keeping track of people. If a mod needs to cut one
   person off, hiding `#anon` from a role does it, and the bot never knows.
