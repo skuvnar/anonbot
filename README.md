@@ -20,8 +20,11 @@ Act accordingly.
   in a channel or a DM. The button is the only way in.
 - copy the token
 
-**2.** Invite it with scopes `bot` and `applications.commands`, and exactly
-two permissions: **View Channel** and **Send Messages**.
+**2.** Invite it with scopes `bot` and `applications.commands`. It needs
+**View Channel** and **Send Messages** to relay. To clear old posts (the
+retention window, on by default) it also needs **Read Message History** and
+**Manage Messages** on `#anon`; if you'd rather it only ever post, leave those
+off and set `ANON_CLEAR_HOURS=0`.
 
 **3.** In `#anon`, deny **Send Messages** for `@everyone`, then add the bot's
 role to the channel with **Send Messages** allowed. The second half matters: a
@@ -63,6 +66,7 @@ server and channel IDs.
 | `MAX_MESSAGE_CHARS` | `2000` | Longest message it'll accept |
 | `RATE_LIMIT_BURST` | `5` | Messages back to back, whole server |
 | `RATE_LIMIT_PER_MINUTE` | `12` | Sustained rate, whole server |
+| `ANON_CLEAR_HOURS` | `48` | Delete channel posts older than this many hours. `0` turns the sweep off |
 
 ## Commands
 
@@ -109,6 +113,11 @@ What that means in practice:
   and how you write or when you post can give you away. The reset keeps the
   trail short. Don't say anything under a number that you wouldn't want joined
   up with the rest of that day.
+- Old posts don't pile up. The channel is swept on a timer and anything past
+  the retention window (48 hours by default, `ANON_CLEAR_HOURS`) is deleted,
+  so a day's writing doesn't sit there for months waiting to be read back
+  together. The sweep looks only at when each message was posted, never what
+  it says, and deletes are permanent - Discord has no trash.
 
 ## Things it doesn't do
 

@@ -26,6 +26,12 @@ also why diagnosing it means reading the channel rather than a log. An
 unexpected crash inside the library would print a Python traceback, which
 names code, not people.
 
+Besides posting, it trims the channel: on a timer it lists the messages there
+- their ids and timestamps, never their content - and deletes any older than
+the retention window (48 hours by default), so a day's trail cannot grow into
+a permanent one. That delete is the one thing it needs a moderator-level
+permission for; lacking it, the sweep just fails and is tried again next pass.
+
 What it can do nothing about: Discord sees every press and every word, and
 root on the host can read this process's memory while it runs.
 
@@ -209,6 +215,14 @@ def _link_pings(text: str) -> str:
 MAX_MESSAGE_CHARS = min(_optional_int("MAX_MESSAGE_CHARS", 2000), 2000)
 RATE_LIMIT_BURST = _optional_int("RATE_LIMIT_BURST", 5)
 RATE_LIMIT_PER_MINUTE = _optional_int("RATE_LIMIT_PER_MINUTE", 12)
+
+# The relay channel is swept on a timer: anything older than this many hours
+# is deleted, so it holds only a rolling window and no post outlives it. The
+# sweep reads message ids and timestamps only, never content, so it needs no
+# message intent - but it does need Manage Messages and Read Message History
+# on the channel. Set to 0 to switch the sweep off and keep the footprint to
+# posting alone.
+CLEAR_AFTER_HOURS = _optional_int("ANON_CLEAR_HOURS", 48)
 
 # Injected at build time, so the startup line can say which commit is running.
 BUILD_SHA = os.environ.get("GIT_SHA", "unknown")
@@ -506,6 +520,41 @@ async def _midnight() -> None:
     await _place_button()
 
 
+def _sweepable(message: discord.Message) -> bool:
+    """True for messages the sweep may delete: everything but the button.
+
+    The sticky button is the one thing that must survive, so the channel is
+    never left with no way to post. It is checked by id, so nothing about the
+    message's content is ever looked at.
+    """
+    return message.id != _button_id
+
+
+@tasks.loop(hours=1)
+async def _sweeper() -> None:
+    """Delete messages older than the retention window.
+
+    The channel is the only record there is, so trimming it is what stops a
+    day's trail from becoming a permanent one. The cut-off is measured against
+    each message's own timestamp, so nothing has to be remembered between runs
+    and a restart cannot lose the thread of it. A failure - most likely the
+    bot lacking Manage Messages - is reported once and retried next pass.
+    """
+    if _relay_channel is None or CLEAR_AFTER_HOURS <= 0:
+        return
+    cutoff = discord.utils.utcnow() - datetime.timedelta(hours=CLEAR_AFTER_HOURS)
+    try:
+        await _relay_channel.purge(
+            limit=None,
+            before=cutoff,
+            check=_sweepable,
+            bulk=True,
+            reason="rolling retention window",
+        )
+    except discord.HTTPException:
+        emit("could not sweep the channel - Discord refused it or the bot lacks Manage Messages")
+
+
 class AnonForm(discord.ui.Modal, title=TEXT_FORM_TITLE):
     """The popup behind the button. One text box, nothing else.
 
@@ -684,6 +733,8 @@ async def on_ready() -> None:
         await _announce(TEXT_RESHUFFLED)
         await _place_button()
         _keeper.start()
+        if CLEAR_AFTER_HOURS > 0:
+            _sweeper.start()
         _started = True
 
     emit(f"ready, build {BUILD_SHA}")
